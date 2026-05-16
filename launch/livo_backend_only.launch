@@ -1,0 +1,7 @@
+<launch>
+  <arg name="config_file" default="backend_varying_illu.yaml" />
+
+  <node pkg="livo_backend" type="livo_backend_node" name="livoBackend" output="screen">
+    <rosparam file="$(find livo_backend)/config/$(arg config_file)" />
+  </node>
+</launch>

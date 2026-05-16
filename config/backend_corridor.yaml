@@ -1,0 +1,71 @@
+# LIVO Backend Configuration for M3DGR Corridor02.bag
+#
+# 数据集特点: 走廊场景，光照相对稳定，有 LiDAR + IMU + Camera + 轮速计（但无 GNSS）
+#             机器人在走廊尽头会回转，适合回环检测
+#
+# rosbag info Corridor02.bag:
+#   /livox/mid360/lidar                    2934 msgs
+#   /livox/mid360/imu                     58672 msgs
+#   /camera/color/image_raw/compressed     8795 msgs
+#   /cv_camera/image_raw/compressed        4400 msgs
+#   /odom                                  5867 msgs   ← 轮速计 (nav_msgs/Odometry)
+#   [无 GNSS topic]
+
+# ============================================================
+# Topic names
+# ============================================================
+livo_odom_topic: "/aft_mapped_to_init"
+gnss_topic: "/mavros/global_position/raw/fix"   # 存在但 bag 里没有，设了也没关系
+wheel_topic: "/odom"
+
+# ============================================================
+# Keyframe selection
+# ============================================================
+keyframe_skip: 5
+keyframe_distance_threshold: 0.5
+keyframe_angle_threshold: 0.3
+
+# ============================================================
+# Sensor factor enable flags
+# ============================================================
+enable_gnss: false          # Corridor02 没有 GNSS 数据！
+enable_wheel: true
+enable_loop_distance: true  # 走廊场景，机器人来回走，特别适合回环
+
+# ============================================================
+# Noise covariances (shared level)
+# ============================================================
+noise:
+  livox_pos_cov: 0.01
+  livox_rot_cov: 0.001
+  gnss_pos_cov: 25.0
+  wheel_pos_cov: 0.5
+  wheel_rot_cov: 0.1
+
+# ============================================================
+# Per-module parameters
+# ============================================================
+gnss_module:
+  gnss_pos_cov: 25.0
+  time_tolerance: 0.5
+  transform_update_interval: 50
+  min_correspondences: 20
+
+wheel_module:
+  wheel_pos_cov: 0.5
+  wheel_rot_cov: 0.1
+  time_tolerance: 0.2
+
+loop_distance_module:
+  search_radius: 3.0        # 走廊窄（~2-3m宽），搜索半径小一点更安全
+  loop_pos_cov: 0.5
+  loop_rot_cov: 0.1
+  min_keyframe_gap: 20      # 走廊短，帧间隔可以设小一点
+  max_keyframe_gap: 300
+
+# ============================================================
+# Output files
+# ============================================================
+output:
+  trajectory_file: "Log/backend_optimized_traj_corridor.txt"
+  optimized_path: "Log/backend_optimized_path_corridor.txt"

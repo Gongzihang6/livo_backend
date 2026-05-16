@@ -1,0 +1,70 @@
+# LIVO Backend Configuration for M3DGR Dataset
+
+# ============================================================
+# Topic names
+# ============================================================
+livo_odom_topic: "/aft_mapped_to_init"
+gnss_topic: "/mavros/global_position/raw/fix"
+wheel_topic: "/odom"
+
+# ============================================================
+# Keyframe selection
+# ============================================================
+keyframe_skip: 5
+keyframe_distance_threshold: 0.5
+keyframe_angle_threshold: 0.3
+
+# ============================================================
+# Sensor factor enable flags
+#   Set true to enable, false to disable each module
+# ============================================================
+enable_gnss: true
+enable_wheel: true
+
+# ============================================================
+# Loop closure module enable flag
+#   (方案一) enable_loop_distance: distance-based loop detection
+#   (方案二) enable_loop_visual:   visual bag-of-words (TODO)
+#   (方案三) enable_loop_scan:     scan context (TODO)
+# ============================================================
+enable_loop_distance: true     # 距离回环，false即可关闭
+# enable_loop_visual:  false   # 视觉词袋回环（预留）
+# enable_loop_scan:    false   # Scan Context回环（预留）
+
+# ============================================================
+# Noise covariances (shared level)
+# ============================================================
+noise:
+  livox_pos_cov: 0.01
+  livox_rot_cov: 0.001
+  gnss_pos_cov: 25.0
+  wheel_pos_cov: 0.5
+  wheel_rot_cov: 0.1
+
+# ============================================================
+# Per-module parameters
+# ============================================================
+gnss_module:
+  gnss_pos_cov: 25.0
+  time_tolerance: 0.5
+  transform_update_interval: 50
+  min_correspondences: 20
+
+wheel_module:
+  wheel_pos_cov: 0.5
+  wheel_rot_cov: 0.1
+  time_tolerance: 0.2
+
+loop_distance_module:
+  search_radius: 5.0        # 回环搜索半径（米）
+  loop_pos_cov: 0.5         # 回环平移噪声
+  loop_rot_cov: 0.1         # 回环旋转噪声
+  min_keyframe_gap: 50      # 回环最小帧间隔，避免连续帧误检
+  max_keyframe_gap: 500     # 回环最大帧间隔
+
+# ============================================================
+# Output files
+# ============================================================
+output:
+  trajectory_file: "Log/backend_optimized_traj.txt"
+  optimized_path: "Log/backend_optimized_path.txt"

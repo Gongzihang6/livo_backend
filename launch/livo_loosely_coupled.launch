@@ -1,0 +1,22 @@
+<launch>
+  <arg name="rviz" default="true" />
+  <arg name="config_file" default="backend_m3dgr.yaml" />
+
+  <arg name="frontend_config" default="$(find fast_livo)/config/m3dgr_mid360.yaml" />
+  <arg name="camera_config" default="$(find fast_livo)/config/camera_pinhole_m3dgr.yaml" />
+  <arg name="rviz_config" default="$(find fast_livo)/rviz_cfg/fast_livo2.rviz" />
+
+  <rosparam command="load" file="$(arg frontend_config)" />
+
+  <node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen">
+    <rosparam file="$(arg camera_config)" />
+  </node>
+
+  <node pkg="livo_backend" type="livo_backend_node" name="livoBackend" output="screen">
+    <rosparam file="$(find livo_backend)/config/$(arg config_file)" />
+  </node>
+
+  <group if="$(arg rviz)">
+    <node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(arg rviz_config)" />
+  </group>
+</launch>

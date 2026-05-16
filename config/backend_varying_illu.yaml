@@ -1,0 +1,63 @@
+# LIVO Backend Configuration for M3DGR Varying-illu05.bag
+# 
+# 数据集特点: 户外场景，光照剧烈变化，有 LiDAR + IMU + Camera + GNSS + 轮速计
+# 
+# rosbag info Varying-illu05.bag:
+#   /livox/mid360/lidar                    4914 msgs
+#   /livox/mid360/imu                     98286 msgs
+#   /camera/color/image_raw/compressed    14732 msgs
+#   /cv_camera/image_raw/compressed        7371 msgs
+#   /mavros/global_position/raw/fix        7371 msgs   ← GNSS
+#   /odom                                  9829 msgs   ← 轮速计 (nav_msgs/Odometry)
+
+# ============================================================
+# Topic names
+# ============================================================
+livo_odom_topic: "/aft_mapped_to_init"
+gnss_topic: "/mavros/global_position/raw/fix"
+wheel_topic: "/odom"
+
+# ============================================================
+# Keyframe selection
+# ============================================================
+keyframe_skip: 5
+keyframe_distance_threshold: 0.5
+keyframe_angle_threshold: 0.3
+
+# ============================================================
+# Sensor factor enable flags
+# ============================================================
+enable_gnss: true
+enable_wheel: false
+enable_loop_distance: false
+
+# ============================================================
+# Noise covariances (shared level)
+# ============================================================
+noise:
+  livox_pos_cov: 0.01
+  livox_rot_cov: 0.001
+  gnss_pos_cov: 25.0
+  wheel_pos_cov: 0.5
+  wheel_rot_cov: 0.1
+
+# ============================================================
+# Per-module parameters
+# ============================================================
+gnss_module:
+  gnss_pos_cov: 25.0
+  time_tolerance: 0.5
+  transform_update_interval: 50
+  min_correspondences: 20
+
+wheel_module:
+  wheel_pos_cov: 0.5
+  wheel_rot_cov: 0.1
+  time_tolerance: 0.2
+
+loop_distance_module:
+  search_radius: 5.0
+  loop_pos_cov: 0.5
+  loop_rot_cov: 0.1
+  min_keyframe_gap: 50
+  max_keyframe_gap: 500
