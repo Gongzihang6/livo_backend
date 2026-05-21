@@ -30,6 +30,7 @@ keyframe_angle_threshold: 0.3
 # ============================================================
 enable_gnss: false
 enable_wheel: true
+enable_loop_closure: true
 enable_loop_distance: false
 
 # ============================================================
@@ -63,6 +64,39 @@ loop_distance_module:
   loop_rot_cov: 0.1
   min_keyframe_gap: 20
   max_keyframe_gap: 300
+
+loop_closure:
+  mode: "hybrid_a"
+  image_topic: "/rgb_img"
+  cloud_topic: "/cloud_registered"
+  image_buffer_size: 40
+  cloud_buffer_size: 20
+  image_time_tolerance: 0.15
+  cloud_time_tolerance: 0.15
+  image_resize_scale: 0.5
+  orb_features: 800
+  detection_interval: 5
+  top_k_candidates: 5
+  min_keyframe_gap: 30
+  max_keyframe_gap: 400
+  min_orb_matches: 40
+  min_orb_inliers: 25
+  min_visual_score: 0.10
+  require_both_modalities: false
+  min_fused_score: 0.82
+  scan_context_rings: 20
+  scan_context_sectors: 60
+  scan_context_max_radius: 35.0
+  scan_context_distance_threshold: 0.22
+  cloud_voxel_size: 0.4
+  icp_max_corr_distance: 1.8
+  icp_fitness_threshold: 0.22
+  min_icp_cloud_points: 30
+  max_livo_loop_distance: 1.5
+  max_gicp_translation_delta: 0.6
+  max_gicp_rotation_delta_deg: 8.0
+  loop_pos_cov: 0.3
+  loop_rot_cov: 0.05
 
 # ============================================================
 # Output files

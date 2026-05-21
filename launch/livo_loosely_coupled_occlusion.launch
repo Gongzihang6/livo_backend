@@ -7,6 +7,11 @@
   <arg name="camera_config" default="$(find fast_livo)/config/camera_pinhole_m3dgr.yaml" />
   <arg name="rviz_config" default="$(find fast_livo)/rviz_cfg/fast_livo2.rviz" />
 
+  <node name="$(anon image_transport_republish_occlusion)"
+        pkg="image_transport"
+        type="republish"
+        args="compressed in:=/camera/color/image_raw raw out:=/camera/color/image_raw" />
+
   <rosparam command="load" file="$(arg frontend_config)" />
 
   <node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen">

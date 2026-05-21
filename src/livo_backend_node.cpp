@@ -1,5 +1,36 @@
 #include "livo_backend/livo_backend.h"
 
+#include <pcl/registration/gicp.h>
+#include <pcl/common/point_tests.h>
+#include <pcl_conversions/pcl_conversions.h>
+#include <sensor_msgs/image_encodings.h>
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <numeric>
+#include <sstream>
+
+namespace {
+
+gtsam::Pose3 poseFromMatrix4f(const Eigen::Matrix4f &transform) {
+    Eigen::Matrix3d rotation = transform.block<3, 3>(0, 0).cast<double>();
+    Eigen::Vector3d translation = transform.block<3, 1>(0, 3).cast<double>();
+    return gtsam::Pose3(gtsam::Rot3(rotation),
+                        gtsam::Point3(translation.x(), translation.y(), translation.z()));
+}
+
+Eigen::Matrix4f poseToMatrix4f(const gtsam::Pose3 &pose) {
+    Eigen::Matrix4f transform = Eigen::Matrix4f::Identity();
+    transform.block<3, 3>(0, 0) = pose.rotation().matrix().cast<float>();
+    transform(0, 3) = static_cast<float>(pose.translation().x());
+    transform(1, 3) = static_cast<float>(pose.translation().y());
+    transform(2, 3) = static_cast<float>(pose.translation().z());
+    return transform;
+}
+
+} // namespace
+
 /************************************************************************/
 /*  LIOBackend 实现                                                      */
 /************************************************************************/
@@ -7,21 +38,42 @@
 LIOBackend::LIOBackend(ros::NodeHandle &nh)
     : nh_(nh), keyframe_counter_(0), isam2_initialized_(false), first_livo_received_(false) {
     readParameters(nh);
+    initializeFactorModules(nh);
     initializePublishers(nh);
     initializeISAM2();
-    initializeFactorModules(nh);
 
     run_output_dir_ = createTimestampedDir(std::string(ROOT_DIR) + "Log");
+    initializeDebugLog();
+    if (loop_closure_module_) {
+        loop_closure_module_->setDebugLogger([this](const std::string &message) {
+            logDebugEvent(std::string("[loop_closure] ") + message);
+        });
+    }
     ROS_INFO_STREAM("[Backend] Run output directory: " << run_output_dir_);
+    // #region debug-point backend-constructor
+    logDebugEvent(std::string("constructor: run_output_dir=") + run_output_dir_);
+    // #endregion
 
     optimized_path_.header.frame_id = "camera_init";
 
     ROS_INFO("[Backend] Initialization complete. Waiting for data...");
+    // #region debug-point backend-init-complete
+    logDebugEvent("initialization complete, waiting for data");
+    // #endregion
 }
 
 LIOBackend::~LIOBackend() {
     ROS_INFO_STREAM("[Backend] Shutting down. Total keyframes: " << keyframes_.size()
                       << ", raw poses: " << raw_poses_.size());
+    // #region debug-point backend-destructor
+    {
+        std::ostringstream oss;
+        oss << "destructor: keyframes=" << keyframes_.size()
+            << ", raw_poses=" << raw_poses_.size()
+            << ", isam2_initialized=" << (isam2_initialized_ ? "true" : "false");
+        logDebugEvent(oss.str());
+    }
+    // #endregion
     if (!run_output_dir_.empty()) {
         saveTrajectory(run_output_dir_ + "/backend_optimized_traj.txt");
         saveFullTrajectory(run_output_dir_ + "/backend_full_traj.txt");
@@ -33,6 +85,8 @@ void LIOBackend::readParameters(ros::NodeHandle &nh) {
     nh.param<std::string>("livo_odom_topic", livo_topic, std::string("/aft_mapped_to_init"));
     nh.param<std::string>("gnss_topic", gnss_topic, std::string("/gnss_data"));
     nh.param<std::string>("wheel_topic", wheel_topic, std::string("/wheel_odometry"));
+    nh.param<std::string>("loop_closure/image_topic", loop_image_topic_, std::string("/rgb_img"));
+    nh.param<std::string>("loop_closure/cloud_topic", loop_cloud_topic_, std::string("/cloud_registered"));
 
     nh.param<int>("keyframe_skip", keyframe_skip_, 5);
     nh.param<double>("keyframe_distance_threshold", keyframe_distance_threshold_, 0.5);
@@ -44,12 +98,20 @@ void LIOBackend::readParameters(ros::NodeHandle &nh) {
     nh.param<bool>("enable_gnss", enable_gnss_, true);
     nh.param<bool>("enable_wheel", enable_wheel_, true);
     nh.param<bool>("enable_loop_distance", enable_loop_distance_, false);
+    nh.param<bool>("enable_loop_closure", enable_loop_closure_, false);
+    nh.param<std::string>("loop_closure/mode", loop_mode_, std::string("hybrid_a"));
 
     ROS_INFO("[Backend] Parameters loaded:");
     ROS_INFO_STREAM("  livo_odom_topic     : " << livo_topic);
     ROS_INFO_STREAM("  gnss_topic          : " << gnss_topic << (enable_gnss_ ? " (enabled)" : " (disabled)"));
     ROS_INFO_STREAM("  wheel_topic         : " << wheel_topic << (enable_wheel_ ? " (enabled)" : " (disabled)"));
     ROS_INFO_STREAM("  loop_distance       : " << (enable_loop_distance_ ? "enabled" : "disabled"));
+    ROS_INFO_STREAM("  loop_closure        : " << (enable_loop_closure_ ? "enabled" : "disabled")
+                                                 << " (mode=" << loop_mode_ << ")");
+    if (enable_loop_closure_) {
+        ROS_INFO_STREAM("  loop_image_topic    : " << loop_image_topic_);
+        ROS_INFO_STREAM("  loop_cloud_topic    : " << loop_cloud_topic_);
+    }
     ROS_INFO_STREAM("  keyframe_skip       : " << keyframe_skip_);
     ROS_INFO_STREAM("  keyframe_dist_thresh: " << keyframe_distance_threshold_);
     ROS_INFO_STREAM("  keyframe_angle_thresh: " << keyframe_angle_threshold_);
@@ -77,6 +139,15 @@ void LIOBackend::initializePublishers(ros::NodeHandle &nh) {
         sub_wheel_ = nh_.subscribe<nav_msgs::Odometry>(wheel_topic, 2000,
                                                        &LIOBackend::wheelOdomCallback, this);
         ROS_INFO_STREAM("[Backend] Subscribed to Wheel: " << wheel_topic);
+    }
+
+    if (enable_loop_closure_) {
+        sub_loop_image_ = nh_.subscribe<sensor_msgs::Image>(loop_image_topic_, 200,
+                                                            &LIOBackend::loopImageCallback, this);
+        sub_loop_cloud_ = nh_.subscribe<sensor_msgs::PointCloud2>(loop_cloud_topic_, 50,
+                                                                  &LIOBackend::loopCloudCallback, this);
+        ROS_INFO_STREAM("[Backend] Subscribed to loop image: " << loop_image_topic_);
+        ROS_INFO_STREAM("[Backend] Subscribed to loop cloud: " << loop_cloud_topic_);
     }
 
     pub_optimized_path_ = nh.advertise<nav_msgs::Path>("/backend/optimized_path", 10);
@@ -113,6 +184,13 @@ void LIOBackend::initializeFactorModules(ros::NodeHandle &nh) {
         factor_modules_.push_back(loop_distance_module_);
         ROS_INFO("[Backend] Distance-based loop closure module loaded");
     }
+
+    if (enable_loop_closure_) {
+        loop_closure_module_.reset(new LoopClosureModule());
+        loop_closure_module_->loadParameters(nh, "loop_closure");
+        factor_modules_.push_back(loop_closure_module_);
+        ROS_INFO_STREAM("[Backend] Unified loop closure module loaded (mode=" << loop_mode_ << ")");
+    }
 }
 
 /* -----------------------------------------------------------------------
@@ -128,6 +206,13 @@ void LIOBackend::livoOdomCallback(const nav_msgs::Odometry::ConstPtr &msg) {
     if (!first_livo_received_) {
         first_livo_received_ = true;
         ROS_INFO_STREAM("[Backend] First LIVO odometry received (t=" << std::fixed << std::setprecision(3) << msg->header.stamp.toSec() << ")");
+        // #region debug-point backend-first-livo
+        {
+            std::ostringstream oss;
+            oss << "first_livo_odom: t=" << std::fixed << std::setprecision(6) << msg->header.stamp.toSec();
+            logDebugEvent(oss.str());
+        }
+        // #endregion
     }
 
     Eigen::Quaterniond q(
@@ -230,10 +315,53 @@ void LIOBackend::wheelOdomCallback(const nav_msgs::Odometry::ConstPtr &msg) {
         ROS_INFO_STREAM("[Backend] First wheel odom received (pos="
                           << std::fixed << std::setprecision(2)
                           << data.position.x() << ", " << data.position.y() << ", " << data.position.z() << ")");
+        // #region debug-point backend-first-wheel
+        {
+            std::ostringstream oss;
+            oss << "first_wheel_odom: t=" << std::fixed << std::setprecision(6) << data.timestamp
+                << ", pos=" << std::setprecision(3)
+                << data.position.x() << "," << data.position.y() << "," << data.position.z();
+            logDebugEvent(oss.str());
+        }
+        // #endregion
     }
     if (wheel_count % 100 == 0) {
         ROS_INFO_STREAM("[Backend] Wheel odom messages received: " << wheel_count);
     }
+}
+
+void LIOBackend::loopImageCallback(const sensor_msgs::Image::ConstPtr &msg) {
+    if (!loop_closure_module_)
+        return;
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    // #region debug-point backend-first-loop-image
+    static bool first_loop_image_logged = false;
+    if (!first_loop_image_logged) {
+        std::ostringstream oss;
+        oss << "first_loop_image: t=" << std::fixed << std::setprecision(6) << msg->header.stamp.toSec();
+        logDebugEvent(oss.str());
+        first_loop_image_logged = true;
+    }
+    // #endregion
+    loop_closure_module_->onImage(msg);
+}
+
+void LIOBackend::loopCloudCallback(const sensor_msgs::PointCloud2::ConstPtr &msg) {
+    if (!loop_closure_module_)
+        return;
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    // #region debug-point backend-first-loop-cloud
+    static bool first_loop_cloud_logged = false;
+    if (!first_loop_cloud_logged) {
+        std::ostringstream oss;
+        oss << "first_loop_cloud: t=" << std::fixed << std::setprecision(6) << msg->header.stamp.toSec();
+        logDebugEvent(oss.str());
+        first_loop_cloud_logged = true;
+    }
+    // #endregion
+    loop_closure_module_->onCloud(msg);
 }
 
 /* -----------------------------------------------------------------------
@@ -244,6 +372,14 @@ void LIOBackend::addKeyframe(const nav_msgs::Odometry::ConstPtr &msg) {
     KeyFrame kf;
     kf.timestamp = msg->header.stamp.toSec();
     kf.id = keyframe_counter_;
+    // #region debug-point backend-add-keyframe-start
+    {
+        std::ostringstream oss;
+        oss << "addKeyframe start: pending_id=" << kf.id
+            << ", timestamp=" << std::fixed << std::setprecision(6) << kf.timestamp;
+        logDebugEvent(oss.str());
+    }
+    // #endregion
 
     Eigen::Quaterniond q(
         msg->pose.pose.orientation.w,
@@ -284,9 +420,42 @@ void LIOBackend::addKeyframe(const nav_msgs::Odometry::ConstPtr &msg) {
         }
     }
 
+    for (auto &module : factor_modules_) {
+        if (!module->isEnabled())
+            continue;
+        // #region debug-point backend-prepare-module
+        {
+            std::ostringstream oss;
+            oss << "prepareKeyframe begin: module=" << module->name()
+                << ", pending_id=" << kf.id;
+            logDebugEvent(oss.str());
+        }
+        // #endregion
+        module->prepareKeyframe(kf);
+        // #region debug-point backend-prepare-module-done
+        {
+            std::ostringstream oss;
+            oss << "prepareKeyframe done: module=" << module->name()
+                << ", pending_id=" << kf.id
+                << ", has_loop_image=" << (kf.has_loop_image ? "true" : "false")
+                << ", has_loop_cloud=" << (kf.has_loop_cloud ? "true" : "false");
+            logDebugEvent(oss.str());
+        }
+        // #endregion
+    }
+
     keyframes_.push_back(kf);
     size_t current_id = keyframes_.size() - 1;
     keyframe_counter_++;
+    // #region debug-point backend-keyframe
+    if (current_id == 0 || current_id % 20 == 0) {
+        std::ostringstream oss;
+        oss << "keyframe accepted: id=" << current_id
+            << ", timestamp=" << std::fixed << std::setprecision(6) << kf.timestamp
+            << ", total_keyframes=" << keyframes_.size();
+        logDebugEvent(oss.str());
+    }
+    // #endregion
 
     /* ---- 第一帧：添加先验因子 ---- */
     if (current_id == 0) {
@@ -336,8 +505,25 @@ void LIOBackend::addKeyframe(const nav_msgs::Odometry::ConstPtr &msg) {
     for (auto &module : factor_modules_) {
         if (!module->isEnabled())
             continue;
+        // #region debug-point backend-evaluate-module
+        {
+            std::ostringstream oss;
+            oss << "evaluate begin: module=" << module->name()
+                << ", current_id=" << current_id;
+            logDebugEvent(oss.str());
+        }
+        // #endregion
 
         auto factors = module->evaluate(current_id, keyframes_, current_estimate_);
+        // #region debug-point backend-evaluate-module-done
+        {
+            std::ostringstream oss;
+            oss << "evaluate done: module=" << module->name()
+                << ", current_id=" << current_id
+                << ", factors=" << factors.size();
+            logDebugEvent(oss.str());
+        }
+        // #endregion
         for (auto &factor : factors) {
             graph_.add(factor);
         }
@@ -350,10 +536,13 @@ void LIOBackend::addKeyframe(const nav_msgs::Odometry::ConstPtr &msg) {
 
     /* ---- iSAM2 增量更新 ---- */
     try {
+        logDebugEvent(std::string("isam2 update begin: current_id=") + std::to_string(current_id));
         isam2_->update(graph_, initial_estimate_);
         current_estimate_ = isam2_->calculateEstimate();
+        logDebugEvent(std::string("isam2 update done: current_id=") + std::to_string(current_id));
     } catch (const std::exception &e) {
         ROS_ERROR_STREAM("[Backend] iSAM2 update failed: " << e.what());
+        logDebugEvent(std::string("isam2 update exception: ") + e.what());
         graph_.resize(0);
         initial_estimate_.clear();
         return;
@@ -379,9 +568,17 @@ void LIOBackend::addKeyframe(const nav_msgs::Odometry::ConstPtr &msg) {
 
     /* ---- 发布 ---- */
     gtsam::Pose3 optimized_pose = current_estimate_.at<gtsam::Pose3>(X(current_id));
+    logDebugEvent(std::string("publish begin: current_id=") + std::to_string(current_id));
     publishOptimizedOdometry(optimized_pose, kf.timestamp);
     publishTF(optimized_pose, kf.timestamp);
     publishOptimizedPath();
+    logDebugEvent(std::string("publish done: current_id=") + std::to_string(current_id));
+
+    if (!run_output_dir_.empty() && current_id > 0 && current_id % 20 == 0) {
+        saveTrajectory(run_output_dir_ + "/backend_optimized_traj.txt");
+        saveFullTrajectory(run_output_dir_ + "/backend_full_traj.txt");
+        logDebugEvent("periodic trajectory snapshot saved");
+    }
 
     if (current_id % 10 == 0) {
         gtsam::Point3 opt_t = optimized_pose.translation();
@@ -461,12 +658,22 @@ void LIOBackend::publishTF(const gtsam::Pose3 &pose, double timestamp) {
 }
 
 void LIOBackend::saveTrajectory(const std::string &filename) {
+    // #region debug-point backend-save-traj-entry
+    {
+        std::ostringstream oss;
+        oss << "saveTrajectory called: filename=" << filename
+            << ", isam2_initialized=" << (isam2_initialized_ ? "true" : "false")
+            << ", keyframes=" << keyframes_.size();
+        logDebugEvent(oss.str());
+    }
+    // #endregion
     if (filename.empty() || !isam2_initialized_)
         return;
 
     std::ofstream fout(filename.c_str());
     if (!fout.is_open()) {
         ROS_WARN_STREAM("[Backend] Cannot open file: " << filename);
+        logDebugEvent(std::string("saveTrajectory open failed: ") + filename);
         return;
     }
 
@@ -489,15 +696,29 @@ void LIOBackend::saveTrajectory(const std::string &filename) {
 
     fout.close();
     ROS_INFO_STREAM("[Backend] Trajectory saved: " << filename << " (" << keyframes_.size() << " keyframes)");
+    // #region debug-point backend-save-traj-done
+    logDebugEvent(std::string("saveTrajectory finished: ") + filename);
+    // #endregion
 }
 
 void LIOBackend::saveFullTrajectory(const std::string &filename) {
+    // #region debug-point backend-save-full-traj-entry
+    {
+        std::ostringstream oss;
+        oss << "saveFullTrajectory called: filename=" << filename
+            << ", isam2_initialized=" << (isam2_initialized_ ? "true" : "false")
+            << ", keyframes=" << keyframes_.size()
+            << ", raw_poses=" << raw_poses_.size();
+        logDebugEvent(oss.str());
+    }
+    // #endregion
     if (filename.empty() || !isam2_initialized_ || keyframes_.empty())
         return;
 
     std::ofstream fout(filename.c_str());
     if (!fout.is_open()) {
         ROS_WARN_STREAM("[Backend] Cannot open file: " << filename);
+        logDebugEvent(std::string("saveFullTrajectory open failed: ") + filename);
         return;
     }
 
@@ -535,6 +756,9 @@ void LIOBackend::saveFullTrajectory(const std::string &filename) {
 
     fout.close();
     ROS_INFO_STREAM("[Backend] Full trajectory saved: " << filename << " (" << raw_poses_.size() << " frames)");
+    // #region debug-point backend-save-full-traj-done
+    logDebugEvent(std::string("saveFullTrajectory finished: ") + filename);
+    // #endregion
 }
 
 void LIOBackend::run() {
@@ -903,6 +1127,642 @@ void WheelFactorModule::findClosest(size_t keyframe_id, const KeyFrameVector &ke
 }
 
 /************************************************************************/
+/*  统一回环模块                                                          */
+/************************************************************************/
+
+void LoopClosureModule::loadParameters(ros::NodeHandle &nh, const std::string &ns) {
+    std::string mode = "hybrid_a";
+    nh.param<std::string>(ns + "/mode", mode, mode);
+    mode_ = parseMode(mode);
+    enabled_ = (mode_ != LoopClosureMode::DISABLED);
+
+    nh.param<int>(ns + "/image_buffer_size", image_buffer_size_, 30);
+    nh.param<int>(ns + "/cloud_buffer_size", cloud_buffer_size_, 30);
+    nh.param<double>(ns + "/image_time_tolerance", image_time_tolerance_, 0.15);
+    nh.param<double>(ns + "/cloud_time_tolerance", cloud_time_tolerance_, 0.15);
+    nh.param<double>(ns + "/image_resize_scale", image_resize_scale_, 0.5);
+    nh.param<int>(ns + "/orb_features", orb_features_, 600);
+    nh.param<int>(ns + "/detection_interval", detection_interval_, 5);
+    nh.param<int>(ns + "/top_k_candidates", top_k_candidates_, 5);
+    nh.param<int>(ns + "/min_keyframe_gap", min_keyframe_gap_, 50);
+    nh.param<int>(ns + "/max_keyframe_gap", max_keyframe_gap_, 500);
+    nh.param<int>(ns + "/min_orb_matches", min_orb_matches_, 30);
+    nh.param<int>(ns + "/min_orb_inliers", min_orb_inliers_, 20);
+    nh.param<double>(ns + "/min_visual_score", min_visual_score_, 0.08);
+    nh.param<bool>(ns + "/require_both_modalities", require_both_modalities_, false);
+    nh.param<double>(ns + "/min_fused_score", min_fused_score_, 0.75);
+    nh.param<int>(ns + "/scan_context_rings", scan_context_rings_, 20);
+    nh.param<int>(ns + "/scan_context_sectors", scan_context_sectors_, 60);
+    nh.param<double>(ns + "/scan_context_max_radius", scan_context_max_radius_, 40.0);
+    nh.param<double>(ns + "/scan_context_distance_threshold", scan_context_distance_threshold_, 0.35);
+    nh.param<double>(ns + "/cloud_voxel_size", cloud_voxel_size_, 0.4);
+    nh.param<double>(ns + "/icp_max_corr_distance", icp_max_corr_distance_, 2.0);
+    nh.param<double>(ns + "/icp_fitness_threshold", icp_fitness_threshold_, 0.6);
+    nh.param<int>(ns + "/min_icp_cloud_points", min_icp_cloud_points_, 30);
+    nh.param<double>(ns + "/max_livo_loop_distance", max_livo_loop_distance_, 2.0);
+    nh.param<double>(ns + "/max_gicp_translation_delta", max_gicp_translation_delta_, 1.0);
+    nh.param<double>(ns + "/max_gicp_rotation_delta_deg", max_gicp_rotation_delta_deg_, 15.0);
+    nh.param<double>(ns + "/loop_pos_cov", loop_pos_cov_, 0.3);
+    nh.param<double>(ns + "/loop_rot_cov", loop_rot_cov_, 0.05);
+
+    orb_detector_ = cv::ORB::create(std::max(orb_features_, 100));
+    warn_unimplemented_mode_ = false;
+
+    ROS_INFO_STREAM("[LoopClosure] mode=" << modeName()
+                                          << ", detect_interval=" << detection_interval_
+                                          << ", top_k=" << top_k_candidates_
+                                          << ", require_both_modalities=" << (require_both_modalities_ ? "true" : "false")
+                                          << ", min_fused_score=" << min_fused_score_
+                                          << ", min_icp_cloud_points=" << min_icp_cloud_points_
+                                          << ", max_livo_loop_distance=" << max_livo_loop_distance_
+                                          << ", max_gicp_translation_delta=" << max_gicp_translation_delta_
+                                          << ", max_gicp_rotation_delta_deg=" << max_gicp_rotation_delta_deg_);
+}
+
+LoopClosureMode LoopClosureModule::parseMode(const std::string &mode) const {
+    if (mode == "hybrid_a" || mode == "A" || mode == "a")
+        return LoopClosureMode::HYBRID_A;
+    if (mode == "visual_b" || mode == "B" || mode == "b")
+        return LoopClosureMode::VISUAL_B;
+    if (mode == "frontend_c" || mode == "C" || mode == "c")
+        return LoopClosureMode::FRONTEND_C;
+    return LoopClosureMode::DISABLED;
+}
+
+std::string LoopClosureModule::modeName() const {
+    switch (mode_) {
+    case LoopClosureMode::HYBRID_A:
+        return "hybrid_a";
+    case LoopClosureMode::VISUAL_B:
+        return "visual_b";
+    case LoopClosureMode::FRONTEND_C:
+        return "frontend_c";
+    default:
+        return "disabled";
+    }
+}
+
+void LoopClosureModule::onImage(const sensor_msgs::Image::ConstPtr &msg) {
+    if (!enabled_)
+        return;
+
+    BufferedImage data;
+    data.timestamp = msg->header.stamp.toSec();
+
+    try {
+        cv_bridge::CvImageConstPtr cv_ptr =
+            cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::MONO8);
+        if (image_resize_scale_ > 0.0 && std::abs(image_resize_scale_ - 1.0) > 1e-3) {
+            cv::resize(cv_ptr->image, data.gray_image, cv::Size(), image_resize_scale_, image_resize_scale_);
+        } else {
+            data.gray_image = cv_ptr->image.clone();
+        }
+    } catch (const cv_bridge::Exception &e) {
+        ROS_WARN_STREAM_THROTTLE(2.0, "[LoopClosure] Failed to convert image: " << e.what());
+        return;
+    }
+
+    image_buffer_.push_back(data);
+    while ((int)image_buffer_.size() > image_buffer_size_)
+        image_buffer_.pop_front();
+}
+
+void LoopClosureModule::onCloud(const sensor_msgs::PointCloud2::ConstPtr &msg) {
+    if (!enabled_)
+        return;
+
+    BufferedCloud data;
+    data.timestamp = msg->header.stamp.toSec();
+    pcl::fromROSMsg(*msg, *data.cloud);
+    if (data.cloud->empty())
+        return;
+
+    cloud_buffer_.push_back(data);
+    while ((int)cloud_buffer_.size() > cloud_buffer_size_)
+        cloud_buffer_.pop_front();
+}
+
+void LoopClosureModule::prepareKeyframe(KeyFrame &keyframe) {
+    if (!enabled_)
+        return;
+
+    attachNearestImage(keyframe);
+    attachNearestCloud(keyframe);
+}
+
+bool LoopClosureModule::attachNearestImage(KeyFrame &keyframe) {
+    if (image_buffer_.empty())
+        return false;
+
+    auto best_it = image_buffer_.end();
+    double min_dt = std::numeric_limits<double>::max();
+    for (auto it = image_buffer_.begin(); it != image_buffer_.end(); ++it) {
+        double dt = std::abs(it->timestamp - keyframe.timestamp);
+        if (dt < min_dt && dt <= image_time_tolerance_) {
+            min_dt = dt;
+            best_it = it;
+        }
+    }
+
+    if (best_it == image_buffer_.end())
+        return false;
+
+    keyframe.loop_image_gray = best_it->gray_image.clone();
+    keyframe.has_loop_image = !keyframe.loop_image_gray.empty();
+    extractImageFeatures(keyframe);
+    return keyframe.has_loop_image;
+}
+
+bool LoopClosureModule::attachNearestCloud(KeyFrame &keyframe) {
+    if (cloud_buffer_.empty())
+        return false;
+
+    auto best_it = cloud_buffer_.end();
+    double min_dt = std::numeric_limits<double>::max();
+    for (auto it = cloud_buffer_.begin(); it != cloud_buffer_.end(); ++it) {
+        double dt = std::abs(it->timestamp - keyframe.timestamp);
+        if (dt < min_dt && dt <= cloud_time_tolerance_) {
+            min_dt = dt;
+            best_it = it;
+        }
+    }
+
+    if (best_it == cloud_buffer_.end() || !best_it->cloud || best_it->cloud->empty())
+        return false;
+
+    LoopCloud::Ptr local_cloud(new LoopCloud());
+    Eigen::Matrix4d T_local_world = keyframe.livo_pose.inverse().matrix();
+    local_cloud->reserve(best_it->cloud->size());
+
+    for (const auto &pt : best_it->cloud->points) {
+        if (!pcl::isFinite(pt))
+            continue;
+        Eigen::Vector4d pw(pt.x, pt.y, pt.z, 1.0);
+        Eigen::Vector4d pl = T_local_world * pw;
+        LoopPointType local_pt;
+        local_pt.x = static_cast<float>(pl.x());
+        local_pt.y = static_cast<float>(pl.y());
+        local_pt.z = static_cast<float>(pl.z());
+        local_pt.intensity = pt.intensity;
+        local_cloud->push_back(local_pt);
+    }
+
+    pcl::VoxelGrid<LoopPointType> voxel;
+    voxel.setLeafSize(cloud_voxel_size_, cloud_voxel_size_, cloud_voxel_size_);
+    voxel.setInputCloud(local_cloud);
+    keyframe.local_cloud.reset(new LoopCloud());
+    voxel.filter(*keyframe.local_cloud);
+
+    keyframe.has_loop_cloud = keyframe.local_cloud && keyframe.local_cloud->size() >= 50;
+    extractCloudFeatures(keyframe);
+    return keyframe.has_loop_cloud;
+}
+
+void LoopClosureModule::extractImageFeatures(KeyFrame &keyframe) {
+    if (!orb_detector_ || keyframe.loop_image_gray.empty()) {
+        keyframe.has_loop_image = false;
+        return;
+    }
+
+    orb_detector_->detectAndCompute(
+        keyframe.loop_image_gray, cv::noArray(), keyframe.loop_keypoints, keyframe.loop_descriptors);
+    keyframe.has_loop_image = !keyframe.loop_descriptors.empty();
+}
+
+void LoopClosureModule::extractCloudFeatures(KeyFrame &keyframe) {
+    if (!keyframe.local_cloud || keyframe.local_cloud->empty()) {
+        keyframe.has_loop_cloud = false;
+        return;
+    }
+
+    keyframe.scan_context = buildScanContext(keyframe.local_cloud);
+    keyframe.has_loop_cloud = !keyframe.scan_context.empty();
+}
+
+cv::Mat LoopClosureModule::buildScanContext(const LoopCloud::Ptr &cloud) const {
+    if (!cloud || cloud->empty())
+        return cv::Mat();
+
+    cv::Mat descriptor = cv::Mat::zeros(scan_context_rings_, scan_context_sectors_, CV_32F);
+    const float sector_step = static_cast<float>(2.0 * M_PI / std::max(scan_context_sectors_, 1));
+
+    for (const auto &pt : cloud->points) {
+        const float radius = std::sqrt(pt.x * pt.x + pt.y * pt.y);
+        if (radius < 1e-3f || radius > scan_context_max_radius_)
+            continue;
+
+        float theta = std::atan2(pt.y, pt.x);
+        if (theta < 0.0f)
+            theta += static_cast<float>(2.0 * M_PI);
+
+        int ring = std::min(scan_context_rings_ - 1,
+                            static_cast<int>((radius / scan_context_max_radius_) * scan_context_rings_));
+        int sector = std::min(scan_context_sectors_ - 1,
+                              static_cast<int>(theta / std::max(sector_step, 1e-6f)));
+        float value = std::max(0.0f, pt.z + 2.0f);
+        descriptor.at<float>(ring, sector) = std::max(descriptor.at<float>(ring, sector), value);
+    }
+
+    return descriptor;
+}
+
+double LoopClosureModule::computeScanContextDistance(const cv::Mat &lhs, const cv::Mat &rhs) const {
+    if (lhs.empty() || rhs.empty() || lhs.size() != rhs.size())
+        return std::numeric_limits<double>::infinity();
+
+    double best_similarity = -1.0;
+    for (int shift = 0; shift < scan_context_sectors_; ++shift) {
+        double dot = 0.0;
+        double lhs_norm = 0.0;
+        double rhs_norm = 0.0;
+
+        for (int r = 0; r < scan_context_rings_; ++r) {
+            for (int c = 0; c < scan_context_sectors_; ++c) {
+                float a = lhs.at<float>(r, c);
+                float b = rhs.at<float>(r, (c + shift) % scan_context_sectors_);
+                dot += static_cast<double>(a) * static_cast<double>(b);
+                lhs_norm += static_cast<double>(a) * static_cast<double>(a);
+                rhs_norm += static_cast<double>(b) * static_cast<double>(b);
+            }
+        }
+
+        if (lhs_norm < 1e-9 || rhs_norm < 1e-9)
+            continue;
+
+        double similarity = dot / (std::sqrt(lhs_norm) * std::sqrt(rhs_norm));
+        best_similarity = std::max(best_similarity, similarity);
+    }
+
+    if (best_similarity < 0.0)
+        return std::numeric_limits<double>::infinity();
+    return 1.0 - best_similarity;
+}
+
+LoopClosureModule::VisualMatchSummary LoopClosureModule::computeVisualMatch(
+    const KeyFrame &current,
+    const KeyFrame &candidate) const {
+    VisualMatchSummary summary;
+    if (current.loop_descriptors.empty() || candidate.loop_descriptors.empty())
+        return summary;
+
+    cv::BFMatcher matcher(cv::NORM_HAMMING, false);
+    std::vector<std::vector<cv::DMatch>> knn_matches;
+    matcher.knnMatch(current.loop_descriptors, candidate.loop_descriptors, knn_matches, 2);
+
+    std::vector<cv::Point2f> cur_pts;
+    std::vector<cv::Point2f> cand_pts;
+    for (const auto &pair : knn_matches) {
+        if (pair.size() < 2)
+            continue;
+        if (pair[0].distance >= 0.75f * pair[1].distance)
+            continue;
+
+        cur_pts.push_back(current.loop_keypoints[pair[0].queryIdx].pt);
+        cand_pts.push_back(candidate.loop_keypoints[pair[0].trainIdx].pt);
+    }
+
+    summary.good_matches = static_cast<int>(cur_pts.size());
+    if (summary.good_matches < min_orb_matches_)
+        return summary;
+
+    std::vector<uchar> inlier_mask;
+    if (cur_pts.size() >= 8) {
+        cv::findFundamentalMat(cur_pts, cand_pts, cv::FM_RANSAC, 3.0, 0.99, inlier_mask);
+    }
+
+    summary.inliers = 0;
+    for (uchar is_inlier : inlier_mask)
+        summary.inliers += static_cast<int>(is_inlier != 0);
+
+    if (inlier_mask.empty())
+        summary.inliers = summary.good_matches;
+
+    int denom = std::max(1, std::min(current.loop_descriptors.rows, candidate.loop_descriptors.rows));
+    summary.score = static_cast<double>(summary.inliers) / static_cast<double>(denom);
+    summary.valid = (summary.good_matches >= min_orb_matches_ &&
+                     summary.inliers >= min_orb_inliers_ &&
+                     summary.score >= min_visual_score_);
+    return summary;
+}
+
+std::vector<LoopClosureModule::CandidateScore> LoopClosureModule::generateHybridCandidates(
+    size_t keyframe_id,
+    const KeyFrameVector &keyframes) const {
+    std::vector<CandidateScore> candidates;
+    if (keyframe_id >= keyframes.size())
+        return candidates;
+
+    const KeyFrame &current = keyframes[keyframe_id];
+    size_t search_begin = (keyframe_id > static_cast<size_t>(max_keyframe_gap_))
+                              ? keyframe_id - static_cast<size_t>(max_keyframe_gap_)
+                              : 0;
+    size_t search_end = keyframe_id - static_cast<size_t>(min_keyframe_gap_);
+
+    if (current.has_loop_cloud) {
+        for (size_t i = search_begin; i < search_end; ++i) {
+            if (loop_history_.count(i))
+                continue;
+
+            const KeyFrame &candidate = keyframes[i];
+            if (!candidate.has_loop_cloud)
+                continue;
+
+            CandidateScore score;
+            score.id = i;
+            score.scan_distance = computeScanContextDistance(current.scan_context, candidate.scan_context);
+            if (!std::isfinite(score.scan_distance) ||
+                score.scan_distance > scan_context_distance_threshold_) {
+                continue;
+            }
+            score.has_cloud_support = true;
+
+            if (current.has_loop_image && candidate.has_loop_image) {
+                VisualMatchSummary visual = computeVisualMatch(current, candidate);
+                score.visual_score = visual.score;
+                score.visual_good_matches = visual.good_matches;
+                score.visual_inliers = visual.inliers;
+                score.has_visual_support = visual.valid;
+                if (require_both_modalities_ && !visual.valid)
+                    continue;
+            }
+
+            score.fused_score = (1.0 - score.scan_distance) + score.visual_score;
+            if (score.fused_score < min_fused_score_)
+                continue;
+            candidates.push_back(score);
+        }
+
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const CandidateScore &lhs, const CandidateScore &rhs) {
+                      return lhs.fused_score > rhs.fused_score;
+                  });
+        if ((int)candidates.size() > top_k_candidates_)
+            candidates.resize(top_k_candidates_);
+        if (debug_logger_ && !candidates.empty()) {
+            std::ostringstream oss;
+            oss << "generateHybridCandidates: keyframe_id=" << keyframe_id
+                << ", cloud_candidates=" << candidates.size();
+            for (const auto &candidate : candidates) {
+                oss << " [id=" << candidate.id
+                    << ", scan=" << std::fixed << std::setprecision(6) << candidate.scan_distance
+                    << ", visual=" << candidate.visual_score << "]";
+            }
+            debug_logger_(oss.str());
+        }
+        return candidates;
+    }
+
+    if (!current.has_loop_image)
+        return candidates;
+
+    for (size_t i = search_begin; i < search_end; ++i) {
+        if (loop_history_.count(i))
+            continue;
+
+        const KeyFrame &candidate = keyframes[i];
+        if (!candidate.has_loop_image)
+            continue;
+
+        VisualMatchSummary visual = computeVisualMatch(current, candidate);
+        if (!visual.valid)
+            continue;
+
+        CandidateScore score;
+        score.id = i;
+        score.visual_score = visual.score;
+        score.visual_good_matches = visual.good_matches;
+        score.visual_inliers = visual.inliers;
+        score.has_visual_support = true;
+        score.fused_score = visual.score;
+        candidates.push_back(score);
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+              [](const CandidateScore &lhs, const CandidateScore &rhs) {
+                  return lhs.fused_score > rhs.fused_score;
+              });
+    if ((int)candidates.size() > top_k_candidates_)
+        candidates.resize(top_k_candidates_);
+    if (debug_logger_ && !candidates.empty()) {
+        std::ostringstream oss;
+        oss << "generateHybridCandidates: keyframe_id=" << keyframe_id
+            << ", image_candidates=" << candidates.size();
+        for (const auto &candidate : candidates) {
+            oss << " [id=" << candidate.id
+                << ", visual=" << std::fixed << std::setprecision(6) << candidate.visual_score << "]";
+        }
+        debug_logger_(oss.str());
+    }
+    return candidates;
+}
+
+bool LoopClosureModule::estimateLoopConstraintGICP(
+    const KeyFrame &current,
+    const KeyFrame &candidate,
+    gtsam::Pose3 &relative_pose,
+    double &fitness_score) const {
+    if (!current.local_cloud || !candidate.local_cloud ||
+        current.local_cloud->empty() || candidate.local_cloud->empty()) {
+        return false;
+    }
+    if (static_cast<int>(current.local_cloud->size()) < min_icp_cloud_points_ ||
+        static_cast<int>(candidate.local_cloud->size()) < min_icp_cloud_points_) {
+        if (debug_logger_) {
+            std::ostringstream oss;
+            oss << "gicp skipped: cloud too small"
+                << ", current_cloud_size=" << current.local_cloud->size()
+                << ", candidate_cloud_size=" << candidate.local_cloud->size()
+                << ", min_required=" << min_icp_cloud_points_;
+            debug_logger_(oss.str());
+        }
+        return false;
+    }
+
+    pcl::GeneralizedIterativeClosestPoint<LoopPointType, LoopPointType> gicp;
+    gicp.setMaximumIterations(64);
+    gicp.setMaxCorrespondenceDistance(icp_max_corr_distance_);
+    gicp.setTransformationEpsilon(1e-4);
+    gicp.setEuclideanFitnessEpsilon(1e-3);
+    gicp.setInputSource(current.local_cloud);
+    gicp.setInputTarget(candidate.local_cloud);
+
+    LoopCloud aligned;
+    Eigen::Matrix4f initial_guess = poseToMatrix4f(candidate.livo_pose.between(current.livo_pose));
+    gicp.align(aligned, initial_guess);
+    fitness_score = gicp.getFitnessScore();
+
+    if (!gicp.hasConverged() || !std::isfinite(fitness_score) ||
+        fitness_score > icp_fitness_threshold_) {
+        return false;
+    }
+
+    Eigen::Matrix4f transform = gicp.getFinalTransformation();
+    if (!transform.allFinite())
+        return false;
+
+    relative_pose = poseFromMatrix4f(transform);
+    return true;
+}
+
+std::vector<gtsam::NonlinearFactor::shared_ptr> LoopClosureModule::evaluate(
+    size_t keyframe_id,
+    const KeyFrameVector &keyframes,
+    const gtsam::Values &current_estimate) {
+    std::vector<gtsam::NonlinearFactor::shared_ptr> factors;
+    (void)current_estimate;
+
+    if (!enabled_ || keyframe_id >= keyframes.size() ||
+        keyframe_id < static_cast<size_t>(min_keyframe_gap_)) {
+        return factors;
+    }
+
+    if (detection_interval_ > 1 &&
+        (keyframe_id % static_cast<size_t>(detection_interval_)) != 0) {
+        return factors;
+    }
+
+    if (mode_ == LoopClosureMode::DISABLED)
+        return factors;
+
+    if ((mode_ == LoopClosureMode::VISUAL_B || mode_ == LoopClosureMode::FRONTEND_C) &&
+        !warn_unimplemented_mode_) {
+        warn_unimplemented_mode_ = true;
+        ROS_WARN_STREAM("[LoopClosure] Mode '" << modeName()
+                        << "' is using the current hybrid_a pipeline as a placeholder."
+                        << " You can later specialize it without changing backend wiring.");
+    }
+
+    const KeyFrame &current = keyframes[keyframe_id];
+    std::vector<CandidateScore> candidates = generateHybridCandidates(keyframe_id, keyframes);
+    if (debug_logger_) {
+        std::ostringstream oss;
+        oss << "evaluate: keyframe_id=" << keyframe_id
+            << ", has_loop_image=" << (current.has_loop_image ? "true" : "false")
+            << ", has_loop_cloud=" << (current.has_loop_cloud ? "true" : "false")
+            << ", candidates=" << candidates.size();
+        debug_logger_(oss.str());
+    }
+    if (candidates.empty())
+        return factors;
+
+    for (const auto &candidate_score : candidates) {
+        const KeyFrame &candidate = keyframes[candidate_score.id];
+        gtsam::Pose3 prior_relative_pose = candidate.livo_pose.between(current.livo_pose);
+        const double prior_translation = prior_relative_pose.translation().norm();
+        if (debug_logger_) {
+            std::ostringstream oss;
+            oss << "candidate begin: current_id=" << keyframe_id
+                << ", candidate_id=" << candidate_score.id
+                << ", cloud_support=" << (candidate_score.has_cloud_support ? "true" : "false")
+                << ", visual_support=" << (candidate_score.has_visual_support ? "true" : "false")
+                << ", scan_distance=" << std::fixed << std::setprecision(6) << candidate_score.scan_distance
+                << ", visual_score=" << candidate_score.visual_score
+                << ", fused_score=" << candidate_score.fused_score
+                << ", visual_matches=" << candidate_score.visual_good_matches
+                << ", visual_inliers=" << candidate_score.visual_inliers
+                << ", prior_translation=" << prior_translation;
+            debug_logger_(oss.str());
+        }
+        if (require_both_modalities_ &&
+            !(candidate_score.has_cloud_support && candidate_score.has_visual_support)) {
+            if (debug_logger_) {
+                std::ostringstream oss;
+                oss << "candidate rejected: current_id=" << keyframe_id
+                    << ", candidate_id=" << candidate_score.id
+                    << ", reason=require_both_modalities";
+                debug_logger_(oss.str());
+            }
+            continue;
+        }
+        if (candidate_score.has_cloud_support && prior_translation > max_livo_loop_distance_) {
+            if (debug_logger_) {
+                std::ostringstream oss;
+                oss << "candidate rejected: current_id=" << keyframe_id
+                    << ", candidate_id=" << candidate_score.id
+                    << ", reason=prior_translation_too_large"
+                    << ", prior_translation=" << std::fixed << std::setprecision(6) << prior_translation
+                    << ", limit=" << max_livo_loop_distance_;
+                debug_logger_(oss.str());
+            }
+            continue;
+        }
+        if (debug_logger_) {
+            std::ostringstream oss;
+            oss << "gicp begin: current_id=" << keyframe_id
+                << ", candidate_id=" << candidate_score.id
+                << ", current_cloud_size=" << (current.local_cloud ? current.local_cloud->size() : 0)
+                << ", candidate_cloud_size=" << (candidate.local_cloud ? candidate.local_cloud->size() : 0)
+                << ", scan_distance=" << std::fixed << std::setprecision(6) << candidate_score.scan_distance;
+            debug_logger_(oss.str());
+        }
+
+        gtsam::Pose3 relative_pose;
+        double fitness_score = std::numeric_limits<double>::infinity();
+        if (!estimateLoopConstraintGICP(current, candidate, relative_pose, fitness_score))
+        {
+            if (debug_logger_) {
+                std::ostringstream oss;
+                oss << "gicp rejected: current_id=" << keyframe_id
+                    << ", candidate_id=" << candidate_score.id;
+                debug_logger_(oss.str());
+            }
+            continue;
+        }
+        gtsam::Pose3 correction_pose = prior_relative_pose.between(relative_pose);
+        const double correction_translation = correction_pose.translation().norm();
+        Eigen::AngleAxisd correction_axis_angle(correction_pose.rotation().matrix());
+        const double correction_rotation_deg = std::abs(correction_axis_angle.angle()) * 180.0 / M_PI;
+        if (correction_translation > max_gicp_translation_delta_ ||
+            correction_rotation_deg > max_gicp_rotation_delta_deg_) {
+            if (debug_logger_) {
+                std::ostringstream oss;
+                oss << "candidate rejected: current_id=" << keyframe_id
+                    << ", candidate_id=" << candidate_score.id
+                    << ", reason=gicp_delta_too_large"
+                    << ", correction_translation=" << std::fixed << std::setprecision(6) << correction_translation
+                    << ", correction_rotation_deg=" << correction_rotation_deg
+                    << ", translation_limit=" << max_gicp_translation_delta_
+                    << ", rotation_limit=" << max_gicp_rotation_delta_deg_;
+                debug_logger_(oss.str());
+            }
+            continue;
+        }
+
+        gtsam::Vector6 noise_vec;
+        noise_vec << loop_rot_cov_, loop_rot_cov_, loop_rot_cov_,
+            loop_pos_cov_, loop_pos_cov_, loop_pos_cov_;
+        auto base_noise = noiseModel::Diagonal::Variances(noise_vec);
+        auto robust_noise = noiseModel::Robust::Create(
+            noiseModel::mEstimator::Huber::Create(1.345), base_noise);
+
+        factors.push_back(gtsam::make_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
+            X(candidate_score.id), X(keyframe_id), relative_pose, robust_noise));
+
+        loop_history_[candidate_score.id] = keyframe_id;
+        ROS_INFO_STREAM("[LoopClosure] Loop accepted: KF " << candidate_score.id
+                          << " <-> KF " << keyframe_id
+                          << " | mode=" << modeName()
+                          << " | scan_dist=" << candidate_score.scan_distance
+                          << " | visual_score=" << candidate_score.visual_score
+                          << " | icp_fitness=" << fitness_score);
+        if (debug_logger_) {
+            std::ostringstream oss;
+            oss << "gicp accepted: current_id=" << keyframe_id
+                << ", candidate_id=" << candidate_score.id
+                << ", fitness=" << std::fixed << std::setprecision(6) << fitness_score
+                << ", correction_translation=" << correction_translation
+                << ", correction_rotation_deg=" << correction_rotation_deg
+                << ", visual_support=" << (candidate_score.has_visual_support ? "true" : "false")
+                << ", cloud_support=" << (candidate_score.has_cloud_support ? "true" : "false");
+            debug_logger_(oss.str());
+        }
+        break;
+    }
+
+    return factors;
+}
+
+/************************************************************************/
 /*  距离回环因子模块 (方案一)                                              */
 /************************************************************************/
 
@@ -1011,6 +1871,30 @@ std::string LIOBackend::createTimestampedDir(const std::string &base_dir) {
     createDirectory(run_dir);
 
     return run_dir;
+}
+
+void LIOBackend::initializeDebugLog() {
+    if (run_output_dir_.empty()) {
+        return;
+    }
+    debug_log_.open((run_output_dir_ + "/runtime_backend.log").c_str(), std::ios::out);
+    if (!debug_log_.is_open()) {
+        ROS_WARN_STREAM("[Backend] Failed to open debug log: " << run_output_dir_ << "/runtime_backend.log");
+        return;
+    }
+    logDebugEvent(std::string("debug log initialized at ") + run_output_dir_ + "/runtime_backend.log");
+}
+
+void LIOBackend::logDebugEvent(const std::string &message) {
+    if (!debug_log_.is_open()) {
+        return;
+    }
+    std::time_t now = std::time(nullptr);
+    std::tm *tm_now = std::localtime(&now);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm_now);
+    debug_log_ << "[" << buf << "] " << message << std::endl;
+    debug_log_.flush();
 }
 
 int main(int argc, char **argv) {

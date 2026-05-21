@@ -8,9 +8,17 @@
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
 #include <ros/ros.h>
+#include <sensor_msgs/Image.h>
 #include <sensor_msgs/NavSatFix.h>
+#include <sensor_msgs/PointCloud2.h>
 #include <tf/transform_broadcaster.h>
 #include <tf/transform_datatypes.h>
+
+#include <cv_bridge/cv_bridge.h>
+#include <opencv2/calib3d.hpp>
+#include <opencv2/core/core.hpp>
+#include <opencv2/features2d.hpp>
+#include <opencv2/imgproc.hpp>
 
 #include <gtsam/base/Matrix.h>
 #include <gtsam/base/Vector.h>
@@ -24,10 +32,15 @@
 #include <gtsam/nonlinear/Values.h>
 #include <gtsam/slam/BetweenFactor.h>
 
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
+
 #include <cmath>
 #include <ctime>
 #include <deque>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -40,16 +53,31 @@ using namespace gtsam;
 
 using gtsam::symbol_shorthand::X;
 
+using LoopPointType = pcl::PointXYZI;
+using LoopCloud = pcl::PointCloud<LoopPointType>;
+
 /* ========================================================================
  * 数据结构定义
  * ======================================================================== */
 
 struct KeyFrame {
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW // 添加此宏以保证内存对齐
+    KeyFrame()
+        : timestamp(0.0), id(0), local_cloud(new LoopCloud()),
+          has_loop_image(false), has_loop_cloud(false), loop_visual_score(0.0) {}
+
     double timestamp;
     gtsam::Pose3 livo_pose;
     gtsam::Pose3 optimized_pose;
     size_t id;
+    cv::Mat loop_image_gray;
+    std::vector<cv::KeyPoint> loop_keypoints;
+    cv::Mat loop_descriptors;
+    LoopCloud::Ptr local_cloud;
+    cv::Mat scan_context;
+    bool has_loop_image;
+    bool has_loop_cloud;
+    double loop_visual_score;
 };
 using KeyFrameVector = std::vector<KeyFrame, Eigen::aligned_allocator<KeyFrame>>;
 struct GNSSData {
@@ -103,6 +131,9 @@ public:
         size_t keyframe_id,
         const KeyFrameVector &keyframes,
         const gtsam::Values &current_estimate) = 0;
+    virtual void onImage(const sensor_msgs::Image::ConstPtr &msg) {}
+    virtual void onCloud(const sensor_msgs::PointCloud2::ConstPtr &msg) {}
+    virtual void prepareKeyframe(KeyFrame &keyframe) {}
 
     void setEnabled(bool en) { enabled_ = en; }
     bool isEnabled() const { return enabled_; }
@@ -211,6 +242,111 @@ private:
     std::map<size_t, size_t> loop_history_;
 };
 
+enum class LoopClosureMode {
+    DISABLED = 0,
+    HYBRID_A = 1,
+    VISUAL_B = 2,
+    FRONTEND_C = 3,
+};
+
+class LoopClosureModule : public FactorModule {
+public:
+    LoopClosureModule() { name_ = "loop_closure"; }
+
+    void loadParameters(ros::NodeHandle &nh, const std::string &ns) override;
+    std::vector<gtsam::NonlinearFactor::shared_ptr> evaluate(
+        size_t keyframe_id,
+        const KeyFrameVector &keyframes,
+        const gtsam::Values &current_estimate) override;
+    void onImage(const sensor_msgs::Image::ConstPtr &msg) override;
+    void onCloud(const sensor_msgs::PointCloud2::ConstPtr &msg) override;
+    void prepareKeyframe(KeyFrame &keyframe) override;
+    void setDebugLogger(const std::function<void(const std::string &)> &logger) { debug_logger_ = logger; }
+
+private:
+    struct BufferedImage {
+        double timestamp = 0.0;
+        cv::Mat gray_image;
+    };
+
+    struct BufferedCloud {
+        double timestamp = 0.0;
+        LoopCloud::Ptr cloud;
+
+        BufferedCloud() : cloud(new LoopCloud()) {}
+    };
+
+    struct CandidateScore {
+        size_t id = 0;
+        double scan_distance = std::numeric_limits<double>::infinity();
+        double visual_score = 0.0;
+        double fused_score = -std::numeric_limits<double>::infinity();
+        int visual_good_matches = 0;
+        int visual_inliers = 0;
+        bool has_cloud_support = false;
+        bool has_visual_support = false;
+    };
+
+    struct VisualMatchSummary {
+        int good_matches = 0;
+        int inliers = 0;
+        double score = 0.0;
+        bool valid = false;
+    };
+
+    LoopClosureMode parseMode(const std::string &mode) const;
+    std::string modeName() const;
+    bool attachNearestImage(KeyFrame &keyframe);
+    bool attachNearestCloud(KeyFrame &keyframe);
+    void extractImageFeatures(KeyFrame &keyframe);
+    void extractCloudFeatures(KeyFrame &keyframe);
+    cv::Mat buildScanContext(const LoopCloud::Ptr &cloud) const;
+    double computeScanContextDistance(const cv::Mat &lhs, const cv::Mat &rhs) const;
+    VisualMatchSummary computeVisualMatch(const KeyFrame &current, const KeyFrame &candidate) const;
+    std::vector<CandidateScore> generateHybridCandidates(size_t keyframe_id, const KeyFrameVector &keyframes) const;
+    bool estimateLoopConstraintGICP(
+        const KeyFrame &current,
+        const KeyFrame &candidate,
+        gtsam::Pose3 &relative_pose,
+        double &fitness_score) const;
+
+    LoopClosureMode mode_ = LoopClosureMode::DISABLED;
+    bool warn_unimplemented_mode_ = false;
+    int image_buffer_size_ = 30;
+    int cloud_buffer_size_ = 30;
+    double image_time_tolerance_ = 0.15;
+    double cloud_time_tolerance_ = 0.15;
+    double image_resize_scale_ = 0.5;
+    int orb_features_ = 600;
+    int detection_interval_ = 5;
+    int top_k_candidates_ = 5;
+    int min_keyframe_gap_ = 50;
+    int max_keyframe_gap_ = 500;
+    int min_orb_matches_ = 30;
+    int min_orb_inliers_ = 20;
+    double min_visual_score_ = 0.08;
+    bool require_both_modalities_ = false;
+    double min_fused_score_ = 0.75;
+    int scan_context_rings_ = 20;
+    int scan_context_sectors_ = 60;
+    double scan_context_max_radius_ = 40.0;
+    double scan_context_distance_threshold_ = 0.35;
+    double cloud_voxel_size_ = 0.4;
+    double icp_max_corr_distance_ = 2.0;
+    double icp_fitness_threshold_ = 0.6;
+    int min_icp_cloud_points_ = 30;
+    double max_livo_loop_distance_ = 2.0;
+    double max_gicp_translation_delta_ = 1.0;
+    double max_gicp_rotation_delta_deg_ = 15.0;
+    double loop_pos_cov_ = 0.3;
+    double loop_rot_cov_ = 0.05;
+    cv::Ptr<cv::ORB> orb_detector_;
+    std::deque<BufferedImage> image_buffer_;
+    std::deque<BufferedCloud> cloud_buffer_;
+    std::map<size_t, size_t> loop_history_;
+    std::function<void(const std::string &)> debug_logger_;
+};
+
 /* ========================================================================
  * 主后端类
  * ======================================================================== */
@@ -226,6 +362,8 @@ private:
     void livoOdomCallback(const nav_msgs::Odometry::ConstPtr &msg);
     void gnssCallback(const sensor_msgs::NavSatFix::ConstPtr &msg);
     void wheelOdomCallback(const nav_msgs::Odometry::ConstPtr &msg);
+    void loopImageCallback(const sensor_msgs::Image::ConstPtr &msg);
+    void loopCloudCallback(const sensor_msgs::PointCloud2::ConstPtr &msg);
 
     void readParameters(ros::NodeHandle &nh);
     void initializePublishers(ros::NodeHandle &nh);
@@ -241,6 +379,8 @@ private:
     void saveFullTrajectory(const std::string &filename);
     std::string createTimestampedDir(const std::string &base_dir);
     bool createDirectory(const std::string &path);
+    void initializeDebugLog();
+    void logDebugEvent(const std::string &message);
 
     std::mutex mtx_;
 
@@ -248,6 +388,8 @@ private:
     ros::Subscriber sub_livo_odom_;
     ros::Subscriber sub_gnss_;
     ros::Subscriber sub_wheel_;
+    ros::Subscriber sub_loop_image_;
+    ros::Subscriber sub_loop_cloud_;
 
     ros::Publisher pub_optimized_path_;
     ros::Publisher pub_optimized_odom_;
@@ -274,6 +416,7 @@ private:
     std::shared_ptr<GNSSFactorModule> gnss_module_;
     std::shared_ptr<WheelFactorModule> wheel_module_;
     std::shared_ptr<LoopDistanceModule> loop_distance_module_;
+    std::shared_ptr<LoopClosureModule> loop_closure_module_;
 
     /* ---- 参数 ---- */
     int keyframe_skip_;
@@ -284,7 +427,12 @@ private:
     bool enable_gnss_;
     bool enable_wheel_;
     bool enable_loop_distance_;
+    bool enable_loop_closure_;
+    std::string loop_mode_;
+    std::string loop_image_topic_;
+    std::string loop_cloud_topic_;
     std::string run_output_dir_;
+    std::ofstream debug_log_;
 
     nav_msgs::Path optimized_path_;
 };

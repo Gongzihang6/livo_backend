@@ -11,8 +11,11 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread -fexceptions")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -Wall -march=native -DNDEBUG")
 
 find_package(catkin REQUIRED COMPONENTS
+  cv_bridge
   geometry_msgs
   nav_msgs
+  pcl_conversions
+  pcl_ros
   sensor_msgs
   roscpp
   rospy
@@ -24,16 +27,20 @@ find_package(catkin REQUIRED COMPONENTS
 find_package(Eigen3 REQUIRED)
 find_package(GTSAM REQUIRED)
 find_package(PCL REQUIRED)
+find_package(OpenCV REQUIRED)
+set(GTSAM_INCLUDE_DIRS ${GTSAM_INCLUDE_DIR})
 
 catkin_package(
-  CATKIN_DEPENDS geometry_msgs nav_msgs roscpp rospy std_msgs message_runtime
-  DEPENDS EIGEN3 GTSAM
+  CATKIN_DEPENDS cv_bridge geometry_msgs nav_msgs pcl_conversions pcl_ros roscpp rospy sensor_msgs std_msgs message_runtime
+  DEPENDS EIGEN3 GTSAM PCL OpenCV
 )
 
 include_directories(
   ${catkin_INCLUDE_DIRS}
   ${EIGEN3_INCLUDE_DIR}
   ${GTSAM_INCLUDE_DIR}
+  ${PCL_INCLUDE_DIRS}
+  ${OpenCV_INCLUDE_DIRS}
   include
 )
 
@@ -46,6 +53,7 @@ add_executable(livo_backend_node
 target_link_libraries(livo_backend_node
   ${catkin_LIBRARIES}
   ${GTSAM_LIBRARIES}
+  ${OpenCV_LIBRARIES}
   ${PCL_LIBRARIES}
   gtsam
   gtsam_unstable
